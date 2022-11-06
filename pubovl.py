@@ -31,6 +31,9 @@ from pyspades import world
 from piqueserver.scheduler import Scheduler
 from ipaddress import AddressValueError, IPv4Address, ip_address
 
+from pyspades.types import IDPool
+from pyspades.types import AttributeSet
+
 
 @command('pubovl', 'ovl', admin_only=True)
 @target_player
@@ -68,36 +71,59 @@ def pubovl(connection, player):
             schedule = Scheduler(player.protocol)                 #dead. this could be abused for cheats so we dont allow this. 
             schedule.call_later(0.1, player.spawn_dead_after_ovl) #need call_later cause otherwise u die as spectator which means u
                                                                   #dont die at all. 
-
         player.send_chat('you are no longer using pubovl')
         protocol.irc_say('* %s is no longer using pubovl' % player.name)
         
 
-@command('externalovl', 'exovl', admin_only=True) #external~outside: "outside the game". player is connected but not joined to the game
-def exovl(connection, ip):                        #                  yet. in this state, since he neither appears on scoreboard nor yet
-    protocol = connection.protocol                #                  spawned, he is completely invisible to everyone like he didnt exist. 
+@command('externalovl', 'exovl', admin_only=True)
+def exovl(connection, ip):
+    protocol = connection.protocol 
     ip_command = ip_address(str(ip))
-    for player in protocol.connections.values():
-        ip_player = ip_address(player.address[0])
-        if player.name is None and ip_player == ip_command:
-            x = 256 # spawn them in the middle of the map instead of the left upper corner. 
-            y = 256
-            z = 0
-            create_player = loaders.CreatePlayer()
-            create_player.player_id = player.player_id
-            create_player.name = "external Deuce" #server doesnt know ur name yet, dont worry, when u rly join u get ur actual name back. 
-            create_player.x = x
-            create_player.y = y
-            create_player.z = z
-            create_player.weapon = 0
-            create_player.team = -1
-            player.send_contained(create_player)
-            player.send_chat("you are now using externalovl")
-            protocol.irc_say('*%s is using externalovl' % ip)
+    protocol.hidden_ip.append(ip_command)
+    
+@command('testo')
+def testovl(connection):
+    p = connection.protocol
+    p.max_players = 0
 
 def apply_script(protocol, connection, config):
+    class pubovlProtocol(protocol):
+        hidden_ip = []
+        hidden_ids = IDPool(start=32)
+    
     class pubovlConnection(connection):
         hidden = False
+        hidden_ex = False
+            
+        def on_join(self):
+            if self.hidden_ex:
+                for player in self.protocol.players.values():
+                    if player.name is None:
+                        continue
+                    existing_player = loaders.ExistingPlayer()
+                    existing_player.name = player.name
+                    existing_player.player_id = player.player_id
+                    existing_player.tool = player.tool or 0
+                    existing_player.weapon = player.weapon
+                    existing_player.kills = player.kills
+                    existing_player.team = player.team.id
+                    existing_player.color = make_color(*player.color)
+                    self.send_contained(existing_player)
+            return connection.on_join(self)
+        
+        def on_connect(self) -> None:
+            for ip in self.protocol.hidden_ip:
+                if ip == ip_address(self.address[0]):
+                    self.hidden_ex = True
+                    self._connection_ack()
+                    self.protocol.hidden_ip.remove(ip)
+            if not self.hidden_ex:
+                return connection.on_connect(self)
+        
+        def _send_connection_data(self) -> None:
+            if self.hidden_ex:
+                self.player_id = self.protocol.hidden_ids.pop()
+            return connection._send_connection_data(self)
         
         def spawn_dead_after_ovl(self):
             kill_action = loaders.KillAction()
@@ -126,14 +152,11 @@ def apply_script(protocol, connection, config):
                 by.add_score(1)
             kill_action.respawn_time = self.get_respawn_time() + 1
             if self.hidden: 
-                for players in self.protocol.players.values():  #dont send kill packet to user of pubovl otherwise
-                    if players.player_id is not self.player_id: #it immediately kicks them out of spectator mode
-                        players.send_contained(kill_action)
+                self.protocol.broadcast_contained(kill_action, sender=self, save=True) 
             else:
                  self.protocol.broadcast_contained(kill_action, save=True)   
             self.world_object.dead = True
             self.respawn()
-
             return connection.kill(self, by, kill_type, grenade)
             
         def spawn(self, pos=None):
@@ -173,18 +196,16 @@ def apply_script(protocol, connection, config):
                 self.send_contained(create_player)
             else:
                 if self.hidden: 
-                    for players in self.protocol.players.values():
-                        if players.player_id is not self.player_id:
-                            players.send_contained(create_player)
+                    self.protocol.broadcast_contained(create_player, sender=self,save=True)
+                elif self.hidden_ex:
+                    self.send_contained(create_player)
                 else:
                     self.protocol.broadcast_contained(create_player, save=True)
             if not spectator:
                 self.on_spawn((x, y, z))
-
             if not self.client_info:
                 handshake_init = loaders.HandShakeInit()
                 self.send_contained(handshake_init)
-
             if not self.hidden:
                 return connection.spawn(self, pos)
 
@@ -192,7 +213,6 @@ def apply_script(protocol, connection, config):
             if self.hidden:                                     #teamid dont align. however if an admin force switches u the
                 self.send_chat('you are no longer using pubovl')#script looses track of wether u r using ovl or not. 
                 self.hidden = False                             #idk why i cant irc relay this. 
-
             return connection.on_team_changed(self, old_team)
             
-    return protocol, pubovlConnection
+    return pubovlProtocol, pubovlConnection
